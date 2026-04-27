@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use meilisearch_types::heed::{EnvClosingEvent, EnvFlags, EnvOpenOptions};
-use meilisearch_types::milli::{CreateOrOpen, Index, Result};
+use meilisearch_types::milli::{CreateOrOpen, Index, Result, UserError};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -201,17 +201,21 @@ impl IndexMap {
         if !path.try_exists()? {
             // Currently, just to check if the system works correctly, I move indexes from and to the
             // `indexes/offloaded` folder but in the future, this will be handled by offloading to S3.
-            //
-            // In a future version, I would like to explore a way to load an index in the background
-            // and return a "loading" error to the first request. Following requests will succeed once
-            // the index is loaded. The advantage would be not blocking the thread while the index is loaded.
-            let offloaded_path = offloaded_path(path);
-            let offloaded_data_path = offloaded_path.join("data.mdb");
-            let size = std::fs::metadata(&offloaded_data_path).unwrap().len();
-            let download_duration = Duration::from_secs_f64(size as f64 / bytes_per_s as f64);
+            let path = path.to_path_buf();
+            std::thread::spawn(move || {
+                let offloaded_path = offloaded_path(&path);
+                let offloaded_data_path = offloaded_path.join("data.mdb");
+                let size = std::fs::metadata(&offloaded_data_path).unwrap().len();
+                let download_duration = Duration::from_secs_f64(size as f64 / bytes_per_s as f64);
 
-            std::fs::rename(offloaded_path, path).unwrap();
-            std::thread::sleep(download_duration);
+                // When I implement this I must make sure that I have a tracking of what I am
+                // already loading to make sure I don't download an index each time a request
+                // is made for it. I could probably use the self.unavailable map to track this.
+                std::fs::rename(offloaded_path, path).unwrap();
+                std::thread::sleep(download_duration);
+            });
+
+            return Err(UserError::IndexLoading.into());
         }
 
         let index = create_or_open_index(path, date, enable_writemap, map_size, create_or_open)?;
@@ -227,21 +231,26 @@ impl IndexMap {
                 // process and should be done at a higher level where more than 20 indexes are kept
                 // on the disk. In the future, I plan to keep around 50-100 indexes on disk, max and
                 // start evicting from there.
-                //
-                // Note that waiting in here is blocking and probably dangerous as it could trigger
-                // a dead lock if the very method we are in is called from a thread that is holding
-                // the index. I should rather move this into a background thread in the future.
                 let evicted_path = evicted_index.path().to_path_buf();
-                self.close(evicted_uuid, evicted_index, enable_writemap, 0).wait();
+                let closing_event = self.close(evicted_uuid, evicted_index, enable_writemap, 0);
 
-                let data_path = evicted_path.join("data.mdb");
-                let size = std::fs::metadata(&data_path).unwrap().len();
-                let upload_duration = Duration::from_secs_f64(size as f64 / bytes_per_s as f64);
+                std::thread::spawn(move || {
+                    // Note that we are waiting for the index to be closed in a dedicated
+                    // thread to avoid blocking and creating deadlocks.
+                    closing_event.wait();
 
-                let offloaded_path = offloaded_path(&evicted_path);
-                std::fs::create_dir_all(&offloaded_path).unwrap();
-                std::fs::rename(evicted_path, offloaded_path).unwrap();
-                std::thread::sleep(upload_duration);
+                    let data_path = evicted_path.join("data.mdb");
+                    let size = std::fs::metadata(&data_path).unwrap().len();
+                    let upload_duration = Duration::from_secs_f64(size as f64 / bytes_per_s as f64);
+
+                    // I must track the different indexes I am uploading to make sure that
+                    // I don't upload the same index multiple times. I could probably use
+                    // the self.unavailable map for that.
+                    let offloaded_path = offloaded_path(&evicted_path);
+                    std::fs::create_dir_all(&offloaded_path).unwrap();
+                    std::fs::rename(evicted_path, offloaded_path).unwrap();
+                    std::thread::sleep(upload_duration);
+                });
             }
             InsertionOutcome::Replaced(_) => {
                 panic!("Attempt to open an index that was already opened")
