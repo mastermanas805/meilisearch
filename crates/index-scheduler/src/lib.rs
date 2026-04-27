@@ -313,7 +313,7 @@ impl IndexScheduler {
         }
 
         let task_db_size = clamp_to_page_size(options.task_db_size);
-        let budget = if options.indexer_config.skip_index_budget {
+        let mut budget = if options.indexer_config.skip_index_budget {
             IndexBudget {
                 map_size: options.index_base_map_size,
                 index_count: options.index_count,
@@ -327,6 +327,9 @@ impl IndexScheduler {
                 options.index_count,
             )
         };
+
+        // TODO remove me. It's just for testing.
+        budget.index_count = 2;
 
         let env = unsafe {
             let env_options = heed::EnvOpenOptions::new();

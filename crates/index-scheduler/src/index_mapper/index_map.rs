@@ -178,19 +178,70 @@ impl IndexMap {
         uuid: &Uuid,
         path: &Path,
         date: Option<(OffsetDateTime, OffsetDateTime)>,
-        enable_mdb_writemap: bool,
+        enable_writemap: bool,
         map_size: usize,
         create_or_open: CreateOrOpen,
     ) -> Result<Index> {
         if !matches!(self.get_unavailable(uuid), Missing) {
             panic!("Attempt to open an index that was unavailable");
         }
-        let index =
-            create_or_open_index(path, date, enable_mdb_writemap, map_size, create_or_open)?;
+
+        // A fake download speed to simulate offloading and uploading of indexes to S3.
+        let bytes_per_s = 10 * 1024 * 1024; // 10MiB/s is slow enough
+
+        // Returns the path to the offloaded index, used for simulating download/upload latency.
+        fn offloaded_path(path: &Path) -> std::path::PathBuf {
+            let mut offloaded_path = path.to_path_buf();
+            offloaded_path.pop();
+            offloaded_path.push("offloaded");
+            offloaded_path.push(path.file_name().unwrap());
+            offloaded_path
+        }
+
+        if !path.try_exists()? {
+            // Currently, just to check if the system works correctly, I move indexes from and to the
+            // `indexes/offloaded` folder but in the future, this will be handled by offloading to S3.
+            //
+            // In a future version, I would like to explore a way to load an index in the background
+            // and return a "loading" error to the first request. Following requests will succeed once
+            // the index is loaded. The advantage would be not blocking the thread while the index is loaded.
+            let offloaded_path = offloaded_path(path);
+            let offloaded_data_path = offloaded_path.join("data.mdb");
+            let size = std::fs::metadata(&offloaded_data_path).unwrap().len();
+            let download_duration = Duration::from_secs_f64(size as f64 / bytes_per_s as f64);
+
+            std::fs::rename(offloaded_path, path).unwrap();
+            std::thread::sleep(download_duration);
+        }
+
+        let index = create_or_open_index(path, date, enable_writemap, map_size, create_or_open)?;
+
         match self.available.insert(*uuid, index.clone()) {
             InsertionOutcome::InsertedNew => (),
             InsertionOutcome::Evicted(evicted_uuid, evicted_index) => {
-                self.close(evicted_uuid, evicted_index, enable_mdb_writemap, 0);
+                // I am still not sure if putting the offloading logic in here is the best approach
+                // but it will work for now. I'll fake the time it takes to upload the index to S3
+                // but I would like in the future to offload in the background.
+                //
+                // I also think the offloading must not be directly linked to the in-memory eviction
+                // process and should be done at a higher level where more than 20 indexes are kept
+                // on the disk. In the future, I plan to keep around 50-100 indexes on disk, max and
+                // start evicting from there.
+                //
+                // Note that waiting in here is blocking and probably dangerous as it could trigger
+                // a dead lock if the very method we are in is called from a thread that is holding
+                // the index. I should rather move this into a background thread in the future.
+                let evicted_path = evicted_index.path().to_path_buf();
+                self.close(evicted_uuid, evicted_index, enable_writemap, 0).wait();
+
+                let data_path = evicted_path.join("data.mdb");
+                let size = std::fs::metadata(&data_path).unwrap().len();
+                let upload_duration = Duration::from_secs_f64(size as f64 / bytes_per_s as f64);
+
+                let offloaded_path = offloaded_path(&evicted_path);
+                std::fs::create_dir_all(&offloaded_path).unwrap();
+                std::fs::rename(evicted_path, offloaded_path).unwrap();
+                std::thread::sleep(upload_duration);
             }
             InsertionOutcome::Replaced(_) => {
                 panic!("Attempt to open an index that was already opened")
@@ -241,14 +292,21 @@ impl IndexMap {
         index: Index,
         enable_mdb_writemap: bool,
         map_size_growth: usize,
-    ) {
+    ) -> EnvClosingEvent {
         let map_size = index.map_size() + map_size_growth;
         let closing_event = index.prepare_for_closing();
         let generation = self.next_generation();
         self.unavailable.insert(
             uuid,
-            Some(ClosingIndex { uuid, closing_event, enable_mdb_writemap, map_size, generation }),
+            Some(ClosingIndex {
+                uuid,
+                closing_event: closing_event.clone(),
+                enable_mdb_writemap,
+                map_size,
+                generation,
+            }),
         );
+        closing_event
     }
 
     /// Attempts to delete and index.
@@ -308,7 +366,7 @@ impl IndexMap {
 fn create_or_open_index(
     path: &Path,
     date: Option<(OffsetDateTime, OffsetDateTime)>,
-    enable_mdb_writemap: bool,
+    enable_writemap: bool,
     map_size: usize,
     create_or_open: CreateOrOpen,
 ) -> Result<Index> {
@@ -327,7 +385,7 @@ fn create_or_open_index(
         ),
     };
     options.max_readers(max_readers);
-    if enable_mdb_writemap {
+    if enable_writemap {
         unsafe { options.flags(EnvFlags::WRITE_MAP) };
     }
 
