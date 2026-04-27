@@ -129,6 +129,8 @@ pub enum FieldIdMapMissingEntry {
 #[allow(clippy::large_enum_variant)]
 #[derive(Error, Debug)]
 pub enum UserError {
+    #[error("Index is being loaded")]
+    IndexLoading,
     #[error(transparent)]
     CelluliteError(#[from] cellulite::Error),
     #[error("Malformed geojson: {0}")]

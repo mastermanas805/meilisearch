@@ -110,6 +110,7 @@ pub trait ErrorCode {
 #[schema(rename_all = "snake_case")]
 pub enum ErrorType {
     Internal,
+    IndexLoading,
     InvalidRequest,
     Auth,
     System,
@@ -121,6 +122,7 @@ impl fmt::Display for ErrorType {
 
         match self {
             Internal => write!(f, "internal"),
+            IndexLoading => write!(f, "index_loading"),
             InvalidRequest => write!(f, "invalid_request"),
             Auth => write!(f, "auth"),
             System => write!(f, "system"),
@@ -204,6 +206,7 @@ macro_rules! make_error_codes {
 
 // An exhaustive list of all the error codes used by meilisearch.
 make_error_codes! {
+IndexLoading                                   , IndexLoading         , 425 ;
 ApiKeyAlreadyExists                            , InvalidRequest       , CONFLICT ;
 ApiKeyNotFound                                 , InvalidRequest       , NOT_FOUND ;
 BadParameter                                   , InvalidRequest       , BAD_REQUEST;
@@ -503,6 +506,7 @@ impl ErrorCode for milli::Error {
             Error::InternalError(_) => Code::Internal,
             Error::IoError(e) => e.error_code(),
             Error::UserError(ref error) => match error {
+                UserError::IndexLoading => Code::IndexLoading,
                 UserError::SerdeJson(_)
                 | UserError::EnvAlreadyOpened
                 | UserError::DocumentLimitReached
