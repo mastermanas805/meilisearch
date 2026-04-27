@@ -128,6 +128,15 @@ impl fmt::Display for ErrorType {
     }
 }
 
+macro_rules! status_code {
+    ($status:ident) => {
+        StatusCode::$status
+    };
+    ($status:literal) => {
+        StatusCode::from_u16($status).unwrap()
+    };
+}
+
 /// Implement all the error codes.
 ///
 /// 1. Make an enum `Code` where each error code is a variant
@@ -139,7 +148,7 @@ impl fmt::Display for ErrorType {
 /// so we can get a value of the `Code` enum with the correct variant by calling
 /// `MyErrorCode::default().error_code()`.
 macro_rules! make_error_codes {
-    ($($code_ident:ident, $err_type:ident, $status:ident);*) => {
+    ($($code_ident:ident, $err_type:ident, $status:tt);*) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
         #[schema(rename_all = "snake_case")]
         pub enum Code {
@@ -150,7 +159,7 @@ macro_rules! make_error_codes {
             pub fn http(&self) -> StatusCode {
                 match self {
                     $(
-                        Code::$code_ident => StatusCode::$status
+                        Code::$code_ident => status_code!($status)
                     ),*
                 }
             }
