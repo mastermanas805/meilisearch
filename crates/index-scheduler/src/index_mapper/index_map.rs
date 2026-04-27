@@ -211,8 +211,8 @@ impl IndexMap {
                 // When I implement this I must make sure that I have a tracking of what I am
                 // already loading to make sure I don't download an index each time a request
                 // is made for it. I could probably use the self.unavailable map to track this.
-                std::fs::rename(offloaded_path, path).unwrap();
                 std::thread::sleep(download_duration);
+                std::fs::rename(offloaded_path, path).unwrap();
             });
 
             return Err(UserError::IndexLoading.into());
@@ -248,8 +248,8 @@ impl IndexMap {
                     // the self.unavailable map for that.
                     let offloaded_path = offloaded_path(&evicted_path);
                     std::fs::create_dir_all(&offloaded_path).unwrap();
-                    std::fs::rename(evicted_path, offloaded_path).unwrap();
                     std::thread::sleep(upload_duration);
+                    std::fs::rename(evicted_path, offloaded_path).unwrap();
                 });
             }
             InsertionOutcome::Replaced(_) => {
