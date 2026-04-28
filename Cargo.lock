@@ -3621,6 +3621,7 @@ dependencies = [
  "meilisearch-types",
  "memmap2",
  "page_size",
+ "papaya",
  "rayon",
  "roaring 0.10.12",
  "rusty-s3",
