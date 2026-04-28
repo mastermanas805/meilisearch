@@ -5,7 +5,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use meilisearch_types::heed::{EnvClosingEvent, EnvFlags, EnvOpenOptions};
-use meilisearch_types::milli::{CreateOrOpen, Index, Result, UserError};
+use meilisearch_types::milli::{CreateOrOpen, Index, Result};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -199,26 +199,6 @@ impl IndexMap {
             offloaded_path
         }
 
-        if !path.try_exists()? {
-            // Currently, just to check if the system works correctly, I move indexes from and to the
-            // `indexes/offloaded` folder but in the future, this will be handled by offloading to S3.
-            let path = path.to_path_buf();
-            std::thread::spawn(move || {
-                let offloaded_path = offloaded_path(&path);
-                let offloaded_data_path = offloaded_path.join("data.mdb");
-                let size = std::fs::metadata(&offloaded_data_path).unwrap().len();
-                let download_duration = Duration::from_secs_f64(size as f64 / bytes_per_s as f64);
-
-                // When I implement this I must make sure that I have a tracking of what I am
-                // already loading to make sure I don't download an index each time a request
-                // is made for it. I could probably use the self.unavailable map to track this.
-                std::thread::sleep(download_duration);
-                std::fs::rename(offloaded_path, path).unwrap();
-            });
-
-            return Err(UserError::IndexLoading.into());
-        }
-
         let index = create_or_open_index(path, date, enable_writemap, map_size, create_or_open)?;
 
         match self.available.insert(*uuid, index.clone()) {
@@ -235,6 +215,7 @@ impl IndexMap {
                 let evicted_path = evicted_index.path().to_path_buf();
                 let closing_event = self.close(evicted_uuid, evicted_index, enable_writemap, 0);
 
+                // TBD do that outside of this function, asynchronously and in a dedicated async runtime.
                 std::thread::spawn(move || {
                     // Note that we are waiting for the index to be closed in a dedicated
                     // thread to avoid blocking and creating deadlocks.

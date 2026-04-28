@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Duration;
 use std::{fs, thread};
 
@@ -12,6 +12,8 @@ use meilisearch_types::milli::update::IndexerConfig;
 use meilisearch_types::milli::{self, CreateOrOpen, FieldDistribution, Index};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tokio::runtime;
+use tokio::sync::Notify;
 use tracing::error;
 use uuid::Uuid;
 
@@ -81,6 +83,9 @@ pub struct IndexMapper {
     /// A few types of long running batches of tasks that act on a single index set this field
     /// so that a handle to the index is available from other threads (search) in an optimized manner.
     currently_updating_index: Arc<RwLock<Option<(String, Index)>>>,
+
+    /// An async runtime used to upload and download indexes.
+    offloading_runtime: Arc<runtime::Runtime>,
 }
 
 /// Whether the index is available for use or is forbidden to be inserted back in the index map
@@ -180,6 +185,12 @@ impl IndexMapper {
             enable_mdb_writemap: options.enable_mdb_writemap,
             indexer_config: options.indexer_config.clone(),
             currently_updating_index: Default::default(),
+            // TBD what's the best stack size for the offloading runtime?
+            offloading_runtime: runtime::Builder::new_multi_thread()
+                .thread_stack_size(3 * 1024 * 1024)
+                .build()
+                .map(Arc::new)
+                .unwrap(),
         })
     }
 
@@ -425,6 +436,14 @@ impl IndexMapper {
                 BeingDeleted => return Err(Error::IndexNotFound(name.to_string())),
                 // since we're lazy, it's possible that the index has not been opened yet.
                 Missing => {
+                    static CURRENTLY_DOWNLOADING: LazyLock<
+                        papaya::HashMap<Uuid, Arc<tokio::sync::Notify>>,
+                    > = LazyLock::new(papaya::HashMap::new);
+
+                    if let Some(notify) = CURRENTLY_DOWNLOADING.pin().get(&uuid) {
+                        self.offloading_runtime.block_on(notify.notified());
+                    }
+
                     let mut index_map = self.index_map.write().unwrap();
                     // between the read lock and the write lock it's not impossible
                     // that someone already opened the index (eg if two searches happen
@@ -433,6 +452,77 @@ impl IndexMapper {
                     match index_map.get(&uuid) {
                         Missing => {
                             let index_path = self.index_path(uuid);
+
+                            // A fake download speed to simulate offloading and uploading of indexes to S3.
+                            let bytes_per_s = 10 * 1024 * 1024; // 10MiB/s is slow enough
+
+                            // Returns the path to the offloaded index, used for simulating download/upload latency.
+                            fn offloaded_path(path: &std::path::Path) -> std::path::PathBuf {
+                                let mut offloaded_path = path.to_path_buf();
+                                offloaded_path.pop();
+                                offloaded_path.push("offloaded");
+                                offloaded_path.push(path.file_name().unwrap());
+                                offloaded_path
+                            }
+
+                            if !index_path.exists() {
+                                // The index is known but the path does not exist. The index has been
+                                // offloaded to S3 so we fire an async background task to download it.
+                                //
+                                // We make sure to register the index being downloaded so that other
+                                // threads can wait for it to finish and not trigger a download again.
+                                match CURRENTLY_DOWNLOADING
+                                    .pin()
+                                    .try_insert_with(uuid, || Arc::new(Notify::new()))
+                                {
+                                    Ok(_) => {
+                                        let index_path = index_path.clone();
+                                        self.offloading_runtime.block_on(async move {
+                                            let offloaded_path = offloaded_path(&index_path);
+                                            let offloaded_data_path =
+                                                offloaded_path.join("data.mdb");
+                                            let size = tokio::fs::metadata(&offloaded_data_path)
+                                                .await
+                                                .unwrap()
+                                                .len();
+                                            let download_duration = Duration::from_secs_f64(
+                                                size as f64 / bytes_per_s as f64,
+                                            );
+
+                                            // When I implement this I must make sure that I have a tracking of what I am
+                                            // already loading to make sure I don't download an index each time a request
+                                            // is made for it. I could probably use the self.unavailable map to track this.
+                                            tokio::time::sleep(download_duration).await;
+                                            let result =
+                                                tokio::fs::rename(offloaded_path, index_path).await;
+
+                                            // Only this download task must be the one notifying waiters
+                                            // and deleting the notifier just after making sure.
+                                            //
+                                            // TBD I think there is a race condition here, where a request
+                                            // could arrive at the moment we finished downloading and don't
+                                            // see the notify in papaya. However, the file should already be
+                                            // there so they will not call the download again.
+                                            CURRENTLY_DOWNLOADING
+                                                .pin()
+                                                .remove(&uuid)
+                                                .unwrap()
+                                                .notify_waiters();
+
+                                            // We make sure that we remove the "lock" on the download,
+                                            // we must not have any early return in this function before.
+                                            result.unwrap();
+
+                                            Ok(()) as Result<()>
+                                        })?;
+                                    }
+                                    Err(notifier) => {
+                                        // Another task is already downloading this index, wait for it to finish.
+                                        let notify = Notify::notified_owned(notifier.clone());
+                                        self.offloading_runtime.block_on(notify);
+                                    }
+                                };
+                            }
 
                             break index_map
                                 .create(
