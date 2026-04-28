@@ -225,30 +225,26 @@ impl IndexMapper {
                 // Error if the UUIDv4 somehow already exists in the map, since it should be fresh.
                 // This is very unlikely to happen in practice.
                 // TODO: it would be better to lazily create the index. But we need an Index::open function for milli.
-                let index = loop {
-                    match self
-                        .index_map
-                        .write()
-                        .unwrap()
-                        .create(
-                            &uuid,
-                            &index_path,
-                            date,
-                            self.enable_mdb_writemap,
-                            self.index_base_map_size,
-                            CreateOrOpen::Create { shards: shards.clone() },
-                        )
-                        .map_err(|e| Error::from_milli(e, Some(uuid.to_string())))?
-                    {
-                        Some(index) => break index,
-                        None => {
-                            // TBD we must receive the task to block on here and wait for the index to be downloaded
-                            // TBD BUT FIRST we must drop the index_map writer lock to wait outside.
-                            eprintln!(
-                                "The index is being downloaded, let's wait a couple of seconds"
-                            );
-                            std::thread::sleep(Duration::from_secs(2));
-                        }
+                let index = match self
+                    .index_map
+                    .write()
+                    .unwrap()
+                    .create(
+                        &uuid,
+                        &index_path,
+                        date,
+                        self.enable_mdb_writemap,
+                        self.index_base_map_size,
+                        CreateOrOpen::Create { shards: shards.clone() },
+                    )
+                    .map_err(|e| Error::from_milli(e, Some(uuid.to_string())))?
+                {
+                    Some(index) => index,
+                    None => {
+                        // It's not possible that we have to wait for the index to be downloaded as
+                        // we have a wtxn so the index was either already there and blocked_on or
+                        // it was not found in the database and we just created it, locally.
+                        unreachable!("Cannot be waiting for an offloaded unknown index")
                     }
                 };
                 let index_rtxn = index.read_txn()?;
@@ -311,7 +307,8 @@ impl IndexMapper {
                     } else {
                         continue;
                     };
-                    reopen.close(&mut self.index_map.write().unwrap());
+                    // TBD correctly manage error
+                    reopen.close(&mut self.index_map.write().unwrap()).unwrap();
                     continue;
                 }
                 Err(None) => return Ok(()),
@@ -460,6 +457,11 @@ impl IndexMapper {
                     //
                     // TBD what should we do if the download fails?
                     self.offloading_runtime.block_on(done.clone()).unwrap();
+                    // Now that we downloaded the index, mark it as missing in
+                    // the index map so that it can be opened after we continue.
+                    //
+                    // TBD correctly handle the error
+                    self.index_map.write().unwrap().mark_downloaded_as_missing(uuid).unwrap();
                     continue;
                 }
                 BeingDeleted => return Err(Error::IndexNotFound(name.to_string())),

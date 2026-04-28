@@ -11,6 +11,7 @@ use meilisearch_types::heed::{EnvClosingEvent, EnvFlags, EnvOpenOptions};
 use meilisearch_types::milli::{CreateOrOpen, Index, Result};
 use time::OffsetDateTime;
 use tokio::sync::{oneshot, Notify};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use super::IndexStatus::{self, Available, BeingDeleted, Closing, Downloading, Missing};
@@ -59,7 +60,7 @@ enum UnavailableStatus {
     Closing(ClosingIndex),
     BeingDeleted,
     BeingUploaded(Arc<Notify>),
-    BeingDownloaded(Shared<oneshot::Receiver<()>>),
+    BeingDownloaded { handle: JoinHandle<Result<()>>, is_finished: Shared<oneshot::Receiver<()>> },
 }
 
 #[derive(Clone)]
@@ -118,7 +119,11 @@ impl ReopenableIndex {
             if reopen.generation != self.generation {
                 return Ok(());
             }
-            map.unavailable.remove(&self.uuid);
+            if let Some(UnavailableStatus::BeingDownloaded { handle, is_finished: _ }) =
+                map.unavailable.remove(&self.uuid)
+            {
+                map.offloading_runtime_handle.block_on(handle).unwrap()?;
+            }
             map.create(
                 &self.uuid,
                 path,
@@ -144,13 +149,18 @@ impl ReopenableIndex {
     /// | BeingDeleted    | BeingDeleted                               |
     /// | Closing         | Missing or Closing depending on generation |
     /// | Available       | Available                                  |
-    pub fn close(self, map: &mut IndexMap) {
+    pub fn close(self, map: &mut IndexMap) -> Result<()> {
         if let Closing(reopen) = map.get(&self.uuid) {
             if reopen.generation != self.generation {
-                return;
+                return Ok(());
             }
-            map.unavailable.remove(&self.uuid);
+            if let Some(UnavailableStatus::BeingDownloaded { handle, is_finished: _ }) =
+                map.unavailable.remove(&self.uuid)
+            {
+                map.offloading_runtime_handle.block_on(handle).unwrap()?;
+            }
         }
+        Ok(())
     }
 }
 
@@ -180,9 +190,20 @@ impl IndexMap {
             Some(UnavailableStatus::BeingDeleted | UnavailableStatus::BeingUploaded(_)) => {
                 BeingDeleted
             }
-            Some(UnavailableStatus::BeingDownloaded(download)) => Downloading(download.clone()),
+            Some(UnavailableStatus::BeingDownloaded { handle: _, is_finished }) => {
+                Downloading(is_finished.clone())
+            }
             None => Missing,
         }
+    }
+
+    pub fn mark_downloaded_as_missing(&mut self, uuid: Uuid) -> Result<()> {
+        if let Some(UnavailableStatus::BeingDownloaded { handle, is_finished: _ }) =
+            self.unavailable.remove(&uuid)
+        {
+            self.offloading_runtime_handle.block_on(handle).unwrap()?;
+        }
+        Ok(())
     }
 
     /// Attempts to create a new index that wasn't existing before.
@@ -228,8 +249,7 @@ impl IndexMap {
             // I also need to spawn a task instead of blocking the current thread
             let (sender, receiver) = oneshot::channel();
             let path = path.to_path_buf();
-            // TBD should I leave the join handle like that?
-            let _handle = self.offloading_runtime_handle.spawn(async move {
+            let handle = self.offloading_runtime_handle.spawn(async move {
                 let offloaded_path = offloaded_path(&path);
                 let offloaded_data_path = offloaded_path.join("data.mdb");
                 let size = tokio::fs::metadata(&offloaded_data_path).await.unwrap().len();
@@ -239,13 +259,18 @@ impl IndexMap {
                 // already loading to make sure I don't download an index each time a request
                 // is made for it. I could probably use the self.unavailable map to track this.
                 tokio::time::sleep(download_duration).await;
-                let result = tokio::fs::rename(offloaded_path, &path).await;
 
-                result.unwrap();
+                // We can return early to make the is_finished channel return an error
+                tokio::fs::rename(offloaded_path, &path).await?;
+
                 sender.send(()).unwrap();
+                Ok(())
             });
 
-            self.unavailable.insert(*uuid, UnavailableStatus::BeingDownloaded(receiver.shared()));
+            self.unavailable.insert(
+                *uuid,
+                UnavailableStatus::BeingDownloaded { handle, is_finished: receiver.shared() },
+            );
 
             // We are currently downloading the index
             return Ok(None);
@@ -376,7 +401,11 @@ impl IndexMap {
         match self.unavailable.remove(uuid) {
             Some(UnavailableStatus::Closing(reopen)) => Err(Some(reopen)),
             Some(UnavailableStatus::BeingDeleted) => Err(None),
-            Some(UnavailableStatus::BeingDownloaded(_) | UnavailableStatus::BeingUploaded(_)) => {
+            Some(UnavailableStatus::BeingDownloaded { handle: _, is_finished: _ }) => {
+                // self.offloading_runtime_handle.block_on(handle).unwrap()
+                todo!("what should happen here")
+            }
+            Some(UnavailableStatus::BeingUploaded(_)) => {
                 todo!("what should happen here")
             }
             None => Ok(None),
