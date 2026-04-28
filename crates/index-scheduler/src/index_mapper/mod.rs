@@ -456,12 +456,13 @@ impl IndexMapper {
                     // for the download to complete before continuing.
                     //
                     // TBD what should we do if the download fails?
-                    self.offloading_runtime.block_on(done.clone()).unwrap();
+                    self.offloading_runtime.block_on(done).unwrap();
+
                     // Now that we downloaded the index, mark it as missing in
                     // the index map so that it can be opened after we continue.
                     //
                     // TBD correctly handle the error
-                    self.index_map.write().unwrap().mark_downloaded_as_missing(uuid).unwrap();
+                    self.index_map.write().unwrap().end_download(&uuid).unwrap();
                     continue;
                 }
                 BeingDeleted => return Err(Error::IndexNotFound(name.to_string())),

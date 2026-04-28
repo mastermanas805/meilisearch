@@ -197,15 +197,6 @@ impl IndexMap {
         }
     }
 
-    pub fn mark_downloaded_as_missing(&mut self, uuid: Uuid) -> Result<()> {
-        if let Some(UnavailableStatus::BeingDownloaded { handle, is_finished: _ }) =
-            self.unavailable.remove(&uuid)
-        {
-            self.offloading_runtime_handle.block_on(handle).unwrap()?;
-        }
-        Ok(())
-    }
-
     /// Attempts to create a new index that wasn't existing before.
     ///
     /// # Status table
@@ -263,7 +254,7 @@ impl IndexMap {
                 // We can return early to make the is_finished channel return an error
                 tokio::fs::rename(offloaded_path, &path).await?;
 
-                sender.send(()).unwrap();
+                let _ = sender.send(());
                 Ok(())
             });
 
@@ -434,6 +425,20 @@ impl IndexMap {
             !matches!(self.unavailable.remove(uuid), Some(UnavailableStatus::Closing(_))),
             "Attempt to finish deletion of an index that was being closed"
         );
+    }
+
+    pub fn end_download(&mut self, uuid: &Uuid) -> Result<()> {
+        assert!(
+            self.available.get(uuid).is_none(),
+            "Attempt to finish download of an index that was already available"
+        );
+
+        if let Some(UnavailableStatus::BeingDownloaded { handle, is_finished: _ }) =
+            self.unavailable.remove(&uuid)
+        {
+            self.offloading_runtime_handle.block_on(handle).unwrap()?;
+        }
+        Ok(())
     }
 }
 
