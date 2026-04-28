@@ -1,8 +1,9 @@
 use std::path::PathBuf;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::{fs, thread};
 
+use futures::future::Shared;
 use meilisearch_types::heed::types::{SerdeJson, Str};
 use meilisearch_types::heed::{Database, Env, RoTxn, RwTxn, WithoutTls};
 use meilisearch_types::milli::database_stats::DatabaseStats;
@@ -13,12 +14,12 @@ use meilisearch_types::milli::{self, CreateOrOpen, FieldDistribution, Index};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::runtime;
-use tokio::sync::Notify;
+use tokio::sync::oneshot;
 use tracing::error;
 use uuid::Uuid;
 
 use self::index_map::IndexMap;
-use self::IndexStatus::{Available, BeingDeleted, Closing, Missing};
+use self::IndexStatus::{Available, BeingDeleted, Closing, Downloading, Missing};
 use crate::uuid_codec::UuidCodec;
 use crate::{Error, IndexBudget, IndexSchedulerOptions, Result};
 
@@ -98,6 +99,8 @@ pub enum IndexStatus {
     BeingDeleted,
     /// Temporarily do not insert the index in the index map as it is currently being resized/evicted from the map.
     Closing(index_map::ClosingIndex),
+    /// The index is currently being downloaded from the network.
+    Downloading(Shared<oneshot::Receiver<()>>),
     /// You can use the index without worrying about anything.
     Available(Index),
 }
@@ -175,8 +178,18 @@ impl IndexMapper {
         options: &IndexSchedulerOptions,
         budget: IndexBudget,
     ) -> Result<Self> {
+        let offloading_runtime = runtime::Builder::new_multi_thread()
+            // TBD what's the best stack size for the offloading runtime?
+            .thread_stack_size(3 * 1024 * 1024)
+            .build()
+            .map(Arc::new)
+            .unwrap();
+
         Ok(Self {
-            index_map: Arc::new(RwLock::new(IndexMap::new(budget.index_count))),
+            index_map: Arc::new(RwLock::new(IndexMap::new(
+                budget.index_count,
+                offloading_runtime.handle().clone(),
+            ))),
             index_mapping: env.create_database(wtxn, Some(db_name::INDEX_MAPPING))?,
             index_stats: env.create_database(wtxn, Some(db_name::INDEX_STATS))?,
             base_path: options.indexes_path.clone(),
@@ -185,12 +198,7 @@ impl IndexMapper {
             enable_mdb_writemap: options.enable_mdb_writemap,
             indexer_config: options.indexer_config.clone(),
             currently_updating_index: Default::default(),
-            // TBD what's the best stack size for the offloading runtime?
-            offloading_runtime: runtime::Builder::new_multi_thread()
-                .thread_stack_size(3 * 1024 * 1024)
-                .build()
-                .map(Arc::new)
-                .unwrap(),
+            offloading_runtime,
         })
     }
 
@@ -217,19 +225,32 @@ impl IndexMapper {
                 // Error if the UUIDv4 somehow already exists in the map, since it should be fresh.
                 // This is very unlikely to happen in practice.
                 // TODO: it would be better to lazily create the index. But we need an Index::open function for milli.
-                let index = self
-                    .index_map
-                    .write()
-                    .unwrap()
-                    .create(
-                        &uuid,
-                        &index_path,
-                        date,
-                        self.enable_mdb_writemap,
-                        self.index_base_map_size,
-                        CreateOrOpen::Create { shards },
-                    )
-                    .map_err(|e| Error::from_milli(e, Some(uuid.to_string())))?;
+                let index = loop {
+                    match self
+                        .index_map
+                        .write()
+                        .unwrap()
+                        .create(
+                            &uuid,
+                            &index_path,
+                            date,
+                            self.enable_mdb_writemap,
+                            self.index_base_map_size,
+                            CreateOrOpen::Create { shards: shards.clone() },
+                        )
+                        .map_err(|e| Error::from_milli(e, Some(uuid.to_string())))?
+                    {
+                        Some(index) => break index,
+                        None => {
+                            // TBD we must receive the task to block on here and wait for the index to be downloaded
+                            // TBD BUT FIRST we must drop the index_map writer lock to wait outside.
+                            eprintln!(
+                                "The index is being downloaded, let's wait a couple of seconds"
+                            );
+                            std::thread::sleep(Duration::from_secs(2));
+                        }
+                    }
+                };
                 let index_rtxn = index.read_txn()?;
                 let stats = crate::index_mapper::IndexStats::new(&index, &index_rtxn)
                     .map_err(|e| Error::from_milli(e, Some(name.to_string())))?;
@@ -433,17 +454,17 @@ impl IndexMapper {
                         .map_err(|e| Error::from_milli(e, Some(uuid.to_string())))?;
                     continue;
                 }
+                IndexStatus::Downloading(done) => {
+                    // The index is currently being downloaded, wait
+                    // for the download to complete before continuing.
+                    //
+                    // TBD what should we do if the download fails?
+                    self.offloading_runtime.block_on(done.clone()).unwrap();
+                    continue;
+                }
                 BeingDeleted => return Err(Error::IndexNotFound(name.to_string())),
                 // since we're lazy, it's possible that the index has not been opened yet.
                 Missing => {
-                    static CURRENTLY_DOWNLOADING: LazyLock<
-                        papaya::HashMap<Uuid, Arc<tokio::sync::Notify>>,
-                    > = LazyLock::new(papaya::HashMap::new);
-
-                    if let Some(notify) = CURRENTLY_DOWNLOADING.pin().get(&uuid) {
-                        self.offloading_runtime.block_on(notify.notified());
-                    }
-
                     let mut index_map = self.index_map.write().unwrap();
                     // between the read lock and the write lock it's not impossible
                     // that someone already opened the index (eg if two searches happen
@@ -453,78 +474,7 @@ impl IndexMapper {
                         Missing => {
                             let index_path = self.index_path(uuid);
 
-                            // A fake download speed to simulate offloading and uploading of indexes to S3.
-                            let bytes_per_s = 10 * 1024 * 1024; // 10MiB/s is slow enough
-
-                            // Returns the path to the offloaded index, used for simulating download/upload latency.
-                            fn offloaded_path(path: &std::path::Path) -> std::path::PathBuf {
-                                let mut offloaded_path = path.to_path_buf();
-                                offloaded_path.pop();
-                                offloaded_path.push("offloaded");
-                                offloaded_path.push(path.file_name().unwrap());
-                                offloaded_path
-                            }
-
-                            if !index_path.exists() {
-                                // The index is known but the path does not exist. The index has been
-                                // offloaded to S3 so we fire an async background task to download it.
-                                //
-                                // We make sure to register the index being downloaded so that other
-                                // threads can wait for it to finish and not trigger a download again.
-                                match CURRENTLY_DOWNLOADING
-                                    .pin()
-                                    .try_insert_with(uuid, || Arc::new(Notify::new()))
-                                {
-                                    Ok(_) => {
-                                        let index_path = index_path.clone();
-                                        self.offloading_runtime.block_on(async move {
-                                            let offloaded_path = offloaded_path(&index_path);
-                                            let offloaded_data_path =
-                                                offloaded_path.join("data.mdb");
-                                            let size = tokio::fs::metadata(&offloaded_data_path)
-                                                .await
-                                                .unwrap()
-                                                .len();
-                                            let download_duration = Duration::from_secs_f64(
-                                                size as f64 / bytes_per_s as f64,
-                                            );
-
-                                            // When I implement this I must make sure that I have a tracking of what I am
-                                            // already loading to make sure I don't download an index each time a request
-                                            // is made for it. I could probably use the self.unavailable map to track this.
-                                            tokio::time::sleep(download_duration).await;
-                                            let result =
-                                                tokio::fs::rename(offloaded_path, index_path).await;
-
-                                            // Only this download task must be the one notifying waiters
-                                            // and deleting the notifier just after making sure.
-                                            //
-                                            // TBD I think there is a race condition here, where a request
-                                            // could arrive at the moment we finished downloading and don't
-                                            // see the notify in papaya. However, the file should already be
-                                            // there so they will not call the download again.
-                                            CURRENTLY_DOWNLOADING
-                                                .pin()
-                                                .remove(&uuid)
-                                                .unwrap()
-                                                .notify_waiters();
-
-                                            // We make sure that we remove the "lock" on the download,
-                                            // we must not have any early return in this function before.
-                                            result.unwrap();
-
-                                            Ok(()) as Result<()>
-                                        })?;
-                                    }
-                                    Err(notifier) => {
-                                        // Another task is already downloading this index, wait for it to finish.
-                                        let notify = Notify::notified_owned(notifier.clone());
-                                        self.offloading_runtime.block_on(notify);
-                                    }
-                                };
-                            }
-
-                            break index_map
+                            match index_map
                                 .create(
                                     &uuid,
                                     &index_path,
@@ -533,11 +483,17 @@ impl IndexMapper {
                                     self.index_base_map_size,
                                     CreateOrOpen::Open,
                                 )
-                                .map_err(|e| Error::from_milli(e, Some(uuid.to_string())))?;
+                                .map_err(|e| Error::from_milli(e, Some(uuid.to_string())))?
+                            {
+                                Some(index) => break index,
+                                // Calling create on an offloaded index will trigger a download. Waiting
+                                // for the download to complete will be handled in the next loop operation.
+                                None => continue,
+                            };
                         }
                         Available(index) => break index,
-                        Closing(_) => {
-                            // the reopening will be handled in the next loop operation
+                        Closing(_) | Downloading(_) => {
+                            // the (re)opening will be handled in the next loop operation
                             continue;
                         }
                         BeingDeleted => return Err(Error::IndexNotFound(name.to_string())),
@@ -583,7 +539,7 @@ impl IndexMapper {
                     continue;
                 }
                 // index already closed
-                Missing => break 'close_index,
+                Missing | Downloading(_) => break 'close_index,
                 // closing requested by this thread or another one; wait for closing to complete, then exit
                 Closing(closing_index) => {
                     if closing_index.wait_timeout(Duration::from_secs(100)).is_none() {

@@ -2,14 +2,18 @@ use std::collections::BTreeMap;
 use std::env::VarError;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::Shared;
+use futures::FutureExt;
 use meilisearch_types::heed::{EnvClosingEvent, EnvFlags, EnvOpenOptions};
 use meilisearch_types::milli::{CreateOrOpen, Index, Result};
 use time::OffsetDateTime;
+use tokio::sync::{oneshot, Notify};
 use uuid::Uuid;
 
-use super::IndexStatus::{self, Available, BeingDeleted, Closing, Missing};
+use super::IndexStatus::{self, Available, BeingDeleted, Closing, Downloading, Missing};
 use crate::clamp_to_page_size;
 use crate::lru::{InsertionOutcome, LruMap};
 
@@ -31,7 +35,7 @@ pub struct IndexMap {
     /// or because they are being closed.
     ///
     /// If they are being deleted, the UUID points to `None`.
-    unavailable: BTreeMap<Uuid, Option<ClosingIndex>>,
+    unavailable: BTreeMap<Uuid, UnavailableStatus>,
 
     /// A monotonically increasing generation number, used to differentiate between multiple successive index closing requests.
     ///
@@ -46,6 +50,16 @@ pub struct IndexMap {
     /// closing request was made, so the reader that "lost the race" has the old generation and will need to wait again for the index
     /// to close.
     generation: usize,
+
+    /// The runtime handle used for downloading and uploading indexes.
+    offloading_runtime_handle: tokio::runtime::Handle,
+}
+
+enum UnavailableStatus {
+    Closing(ClosingIndex),
+    BeingDeleted,
+    BeingUploaded(Arc<Notify>),
+    BeingDownloaded(Shared<oneshot::Receiver<()>>),
 }
 
 #[derive(Clone)]
@@ -141,8 +155,13 @@ impl ReopenableIndex {
 }
 
 impl IndexMap {
-    pub fn new(cap: usize) -> IndexMap {
-        Self { unavailable: Default::default(), available: LruMap::new(cap), generation: 0 }
+    pub fn new(cap: usize, runtime_handle: tokio::runtime::Handle) -> IndexMap {
+        Self {
+            unavailable: Default::default(),
+            available: LruMap::new(cap),
+            generation: 0,
+            offloading_runtime_handle: runtime_handle,
+        }
     }
 
     /// Gets the current status of an index in the map.
@@ -157,8 +176,11 @@ impl IndexMap {
 
     fn get_unavailable(&self, uuid: &Uuid) -> IndexStatus {
         match self.unavailable.get(uuid) {
-            Some(Some(reopen)) => Closing(reopen.clone()),
-            Some(None) => BeingDeleted,
+            Some(UnavailableStatus::Closing(reopen)) => Closing(reopen.clone()),
+            Some(UnavailableStatus::BeingDeleted | UnavailableStatus::BeingUploaded(_)) => {
+                BeingDeleted
+            }
+            Some(UnavailableStatus::BeingDownloaded(download)) => Downloading(download.clone()),
             None => Missing,
         }
     }
@@ -182,7 +204,8 @@ impl IndexMap {
         enable_writemap: bool,
         map_size: usize,
         create_or_open: CreateOrOpen,
-    ) -> Result<Index> {
+        // TBD change this to an explicit enum
+    ) -> Result<Option<Index>> {
         if !matches!(self.get_unavailable(uuid), Missing) {
             panic!("Attempt to open an index that was unavailable");
         }
@@ -197,6 +220,35 @@ impl IndexMap {
             offloaded_path.push("offloaded");
             offloaded_path.push(path.file_name().unwrap());
             offloaded_path
+        }
+
+        if !path.exists() {
+            // TBD Here I am completly blocking any other index to being downloaded in parallel
+            // I need to make this very create method return a NotReadyYet or something.
+            // I also need to spawn a task instead of blocking the current thread
+            let (sender, receiver) = oneshot::channel();
+            let path = path.to_path_buf();
+            // TBD should I leave the join handle like that?
+            let _handle = self.offloading_runtime_handle.spawn(async move {
+                let offloaded_path = offloaded_path(&path);
+                let offloaded_data_path = offloaded_path.join("data.mdb");
+                let size = tokio::fs::metadata(&offloaded_data_path).await.unwrap().len();
+                let download_duration = Duration::from_secs_f64(size as f64 / bytes_per_s as f64);
+
+                // When I implement this I must make sure that I have a tracking of what I am
+                // already loading to make sure I don't download an index each time a request
+                // is made for it. I could probably use the self.unavailable map to track this.
+                tokio::time::sleep(download_duration).await;
+                let result = tokio::fs::rename(offloaded_path, &path).await;
+
+                result.unwrap();
+                sender.send(()).unwrap();
+            });
+
+            self.unavailable.insert(*uuid, UnavailableStatus::BeingDownloaded(receiver.shared()));
+
+            // We are currently downloading the index
+            return Ok(None);
         }
 
         let index = create_or_open_index(path, date, enable_writemap, map_size, create_or_open)?;
@@ -239,7 +291,7 @@ impl IndexMap {
             }
         }
 
-        Ok(index)
+        Ok(Some(index))
     }
 
     /// Increases the current generation. See documentation for this field.
@@ -290,7 +342,7 @@ impl IndexMap {
         let generation = self.next_generation();
         self.unavailable.insert(
             uuid,
-            Some(ClosingIndex {
+            UnavailableStatus::Closing(ClosingIndex {
                 uuid,
                 closing_event: closing_event.clone(),
                 enable_mdb_writemap,
@@ -318,12 +370,15 @@ impl IndexMap {
         uuid: &Uuid,
     ) -> std::result::Result<Option<EnvClosingEvent>, Option<ClosingIndex>> {
         if let Some(index) = self.available.remove(uuid) {
-            self.unavailable.insert(*uuid, None);
+            self.unavailable.insert(*uuid, UnavailableStatus::BeingDeleted);
             return Ok(Some(index.prepare_for_closing()));
         }
         match self.unavailable.remove(uuid) {
-            Some(Some(reopen)) => Err(Some(reopen)),
-            Some(None) => Err(None),
+            Some(UnavailableStatus::Closing(reopen)) => Err(Some(reopen)),
+            Some(UnavailableStatus::BeingDeleted) => Err(None),
+            Some(UnavailableStatus::BeingDownloaded(_) | UnavailableStatus::BeingUploaded(_)) => {
+                todo!("what should happen here")
+            }
             None => Ok(None),
         }
     }
@@ -347,7 +402,7 @@ impl IndexMap {
         );
         // Do not panic if the index was Missing or BeingDeleted
         assert!(
-            !matches!(self.unavailable.remove(uuid), Some(Some(_))),
+            !matches!(self.unavailable.remove(uuid), Some(UnavailableStatus::Closing(_))),
             "Attempt to finish deletion of an index that was being closed"
         );
     }
@@ -397,6 +452,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::super::IndexMapper;
+    use crate::index_mapper::index_map::UnavailableStatus;
     use crate::test_utils::IndexSchedulerHandle;
     use crate::utils::clamp_to_page_size;
     use crate::IndexScheduler;
@@ -412,7 +468,12 @@ mod tests {
         let index_map = mapper.index_map.read().unwrap();
         let (uuid, state) = index_map.unavailable.first_key_value().unwrap();
         assert_eq!(uuid, &expected_uuid);
-        assert_eq!(state.is_some(), is_closing);
+        if is_closing {
+            assert!(matches!(state, UnavailableStatus::Closing(_)));
+        } else {
+            // Notice the ! for "not"
+            assert!(!matches!(state, UnavailableStatus::Closing(_)));
+        }
     }
 
     #[test]
